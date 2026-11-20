@@ -28,6 +28,7 @@ Developed under **[Exploidus](https://github.com/Exploidus)**.
 5. **`HInfinityFilter1D`**: Minimax bounded worst-case disturbance filter for unmodeled dynamics.
 6. **`AdaptiveFilter1D`**: Online covariance estimation adapting to non-stationary sensor noise.
 7. **`WindowedStats<CAPACITY>`**: Zero-allocation sliding-window statistical analyzer computing rolling mean, variance, standard deviation, and peak-to-peak spread over fixed const-generic buffers.
+8. **`ErrorStateKalmanFilter`**: 15-state Error-State Kalman Filter (ESKF/MEKF) tracking 3D position, velocity, unit quaternion attitude, and IMU accelerometer/gyroscope bias drift with Mahalanobis-gated GNSS and magnetometer updates.
 
 ---
 
@@ -54,6 +55,13 @@ With optional `serde` support for state persistence and telemetry serialization:
 aegis-filter = { version = "0.4.0", features = ["serde"] }
 ```
 
+For **ARM Cortex-M4 / Cortex-M33** and single-precision hardware FPUs, enable `single-precision` to compile state representations, covariances, and math routines as `f32`:
+
+```toml
+[dependencies]
+aegis-filter = { version = "0.4.0", default-features = false, features = ["single-precision"] }
+```
+
 ---
 
 ## Example Usage
@@ -64,16 +72,16 @@ aegis-filter = { version = "0.4.0", features = ["serde"] }
 use aegis_filter::{ScalarKalmanFilter, FilterError};
 
 fn main() -> Result<(), FilterError> {
-    // Initial state: 20.0, Initial variance: 5.0, Process noise (Q): 0.01, Measurement noise (R): 0.5
-    let mut filter = ScalarKalmanFilter::new(20.0, 5.0, 0.01, 0.5)?;
+    // Fail-closed initialization with default 3-sigma innovation gating enabled:
+    let mut filter = ScalarKalmanFilter::new_resilient(20.0, 5.0, 0.01, 0.5)?;
 
     let sensor_stream = [20.2, 20.4, 20.1, 999.0 /* spoofed spike */, 20.3];
 
     for &reading in &sensor_stream {
         filter.predict(0.0)?;
 
-        // Update with 3-sigma outlier rejection threshold
-        match filter.update(reading, Some(3.0)) {
+        // Update with default fail-closed gating (spikes are rejected automatically)
+        match filter.update(reading, None) {
             Ok(estimated_state) => {
                 println!("Valid state estimate: {:.3}", estimated_state);
             }
@@ -106,6 +114,12 @@ cargo run --example benchmark --release
 
 # 4. Multi-Sensor Fusion & Automated FDIR (GPS spoof quarantine & Baro/LiDAR handover)
 cargo run --example sensor_fault_fdir
+
+# 5. Drone Altitude Hold & Barometric Sensor Fusion (gust dynamics & static port glitch gating)
+cargo run --example drone_altitude_fusion
+
+# 6. Lithium-ion Battery State of Charge Estimation (UKF with 1st-order Thevenin RC & spike rejection)
+cargo run --example battery_soc_estimation
 ```
 
 ---
@@ -121,7 +135,7 @@ cargo run --example sensor_fault_fdir
   ```
   Produces `libaegis_filter.a` for direct linking with C/C++ toolchains (GCC, Clang, MSVC).
 
-### Integration Example: NASA F Prime GNC Component
+### Integration Example 1: NASA F Prime GNC Component
 
 The repository includes a reference adapter demonstrating how to bind `aegis-filter` into flight software architectures such as NASA's [F Prime](https://nasa.github.io/fprime/) framework:
 
@@ -131,8 +145,16 @@ The repository includes a reference adapter demonstrating how to bind `aegis-fil
 
 ---
 
-## License
+## License & Commercial Inquiries
 
-Dual-licensed under either of:
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+`aegis-filter` is dual-licensed under open-source and commercial terms:
+
+### 1. Open Source (GNU AGPLv3)
+For open-source projects, academic research, and non-commercial mission prototypes, this project is licensed under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**.
+Under this license, any software, autonomous navigation stack, ground control station, or embedded flight firmware incorporating, modifying, or linking `aegis-filter` must make its complete source code available under compatible copyleft terms when distributed or deployed over a network. See [LICENSE](LICENSE) for the full text.
+
+### 2. Proprietary Commercial License
+For aerospace defense contractors, commercial satellite operators, autonomous robotics vendors, and proprietary hardware manufacturers who cannot comply with AGPLv3 copyleft terms or wish to embed `aegis-filter` within proprietary closed-source flight software:
+- Commercial licenses are available without copyleft obligations.
+- Includes custom sensor calibration, sensor-fault isolation (FDIR) integration assistance, and mission support SLA.
+- For commercial licensing terms, custom mission integrations, and volume pricing, contact: **`rahadbhuiya2021@gmail.com`**.

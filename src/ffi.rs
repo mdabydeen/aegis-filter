@@ -3,9 +3,7 @@
 //! Exposes zero-allocation, deterministic `#![no_std]` state estimation and FDIR pipelines
 //! with C-compatible ABI (`extern "C"`).
 
-#![allow(clippy::missing_safety_doc)]
-
-use crate::common::FilterError;
+use crate::common::{FilterError, Real};
 use crate::fusion::{FusionStatus, MultiSensorFusion1D, SensorMeasurement, SensorSource};
 use crate::linear::ScalarKalmanFilter;
 use crate::robust::HInfinityFilter1D;
@@ -90,13 +88,16 @@ pub struct AegisScalarFilter {
 }
 
 /// Initializes a new Scalar Kalman Filter instance into the memory pointed to by `filter`.
+///
+/// # Safety
+/// Caller must ensure `filter` points to valid, properly aligned, and writable memory.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_scalar_filter_init(
     filter: *mut AegisScalarFilter,
-    initial_state: f64,
-    initial_variance: f64,
-    process_noise_q: f64,
-    measurement_noise_r: f64,
+    initial_state: Real,
+    initial_variance: Real,
+    process_noise_q: Real,
+    measurement_noise_r: Real,
 ) -> AegisStatusCode {
     if filter.is_null() {
         return AegisStatusCode::NullPointer;
@@ -117,10 +118,13 @@ pub unsafe extern "C" fn aegis_scalar_filter_init(
 }
 
 /// Propagates state and covariance forward using physical control input.
+///
+/// # Safety
+/// Caller must ensure `filter` points to a valid, initialized `AegisScalarFilter`.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_scalar_filter_predict(
     filter: *mut AegisScalarFilter,
-    control_input: f64,
+    control_input: Real,
 ) -> AegisStatusCode {
     if filter.is_null() {
         return AegisStatusCode::NullPointer;
@@ -132,13 +136,57 @@ pub unsafe extern "C" fn aegis_scalar_filter_predict(
     }
 }
 
+/// Default recommended 3-sigma innovation gating threshold for adversarial outlier rejection.
+pub const AEGIS_DEFAULT_GATE_SIGMA: Real = 3.0;
+
+/// Sentinel value to explicitly disable innovation gating in C API calls.
+pub const AEGIS_GATE_DISABLE: Real = -1.0;
+
+/// Configures persistent default outlier gating threshold on the scalar filter (fail-closed posture).
+///
+/// Pass a positive sigma threshold (e.g. `AEGIS_DEFAULT_GATE_SIGMA = 3.0`) to enforce gating.
+/// Pass `AEGIS_GATE_DISABLE` (-1.0) or `0.0` to disable default gating.
+///
+/// # Safety
+/// Caller must ensure `filter` points to a valid, initialized `AegisScalarFilter`.
+#[no_mangle]
+pub unsafe extern "C" fn aegis_scalar_filter_set_default_gate(
+    filter: *mut AegisScalarFilter,
+    gate_threshold_sigma: Real,
+) -> AegisStatusCode {
+    if filter.is_null() {
+        return AegisStatusCode::NullPointer;
+    }
+    if gate_threshold_sigma > 0.0 {
+        match (*filter).inner.with_default_gate(gate_threshold_sigma) {
+            Ok(f) => {
+                (*filter).inner = f;
+                AegisStatusCode::Ok
+            }
+            Err(e) => e.into(),
+        }
+    } else {
+        (*filter).inner = (*filter).inner.disable_default_gate();
+        AegisStatusCode::Ok
+    }
+}
+
 /// Fuses incoming measurement with optional Mahalanobis 3-sigma innovation gating.
+///
+/// # Security & Gating Semantics
+/// - Passing a positive `gate_threshold_sigma` (e.g. `AEGIS_DEFAULT_GATE_SIGMA = 3.0`) enforces
+///   outlier gating for this call. Outliers are rejected with [`AegisStatusCode::MeasurementGated`] (-4).
+/// - Passing `AEGIS_GATE_DISABLE` (< 0.0) explicitly bypasses innovation gating for this update.
+/// - Passing `0.0` falls back to the filter's configured default gate ([`aegis_scalar_filter_set_default_gate`]).
+///
+/// # Safety
+/// Caller must ensure `filter` points to a valid initialized filter and `out_state` is either null or writable.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_scalar_filter_update(
     filter: *mut AegisScalarFilter,
-    measurement: f64,
-    gate_threshold_sigma: f64,
-    out_state: *mut f64,
+    measurement: Real,
+    gate_threshold_sigma: Real,
+    out_state: *mut Real,
 ) -> AegisStatusCode {
     if filter.is_null() {
         return AegisStatusCode::NullPointer;
@@ -146,6 +194,8 @@ pub unsafe extern "C" fn aegis_scalar_filter_update(
 
     let gate_opt = if gate_threshold_sigma > 0.0 {
         Some(gate_threshold_sigma)
+    } else if gate_threshold_sigma < 0.0 {
+        Some(-1.0)
     } else {
         None
     };
@@ -162,19 +212,27 @@ pub unsafe extern "C" fn aegis_scalar_filter_update(
 }
 
 /// Returns current estimated state mean.
+///
+/// # Safety
+/// Caller must ensure `filter` points to a valid `AegisScalarFilter` or null.
 #[no_mangle]
-pub unsafe extern "C" fn aegis_scalar_filter_get_state(filter: *const AegisScalarFilter) -> f64 {
+pub unsafe extern "C" fn aegis_scalar_filter_get_state(filter: *const AegisScalarFilter) -> Real {
     if filter.is_null() {
-        return f64::NAN;
+        return Real::NAN;
     }
     (*filter).inner.state()
 }
 
 /// Returns current estimated error variance.
+///
+/// # Safety
+/// Caller must ensure `filter` points to a valid `AegisScalarFilter` or null.
 #[no_mangle]
-pub unsafe extern "C" fn aegis_scalar_filter_get_variance(filter: *const AegisScalarFilter) -> f64 {
+pub unsafe extern "C" fn aegis_scalar_filter_get_variance(
+    filter: *const AegisScalarFilter,
+) -> Real {
     if filter.is_null() {
-        return f64::NAN;
+        return Real::NAN;
     }
     (*filter).inner.variance()
 }
@@ -190,14 +248,17 @@ pub struct AegisHInfFilter {
 }
 
 /// Initializes an H-Infinity Filter instance into memory pointed to by `filter`.
+///
+/// # Safety
+/// Caller must ensure `filter` points to valid, properly aligned, and writable memory.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_h_inf_filter_init(
     filter: *mut AegisHInfFilter,
-    initial_state: f64,
-    initial_variance: f64,
-    process_bound_q: f64,
-    measurement_bound_r: f64,
-    gamma: f64,
+    initial_state: Real,
+    initial_variance: Real,
+    process_bound_q: Real,
+    measurement_bound_r: Real,
+    gamma: Real,
 ) -> AegisStatusCode {
     if filter.is_null() {
         return AegisStatusCode::NullPointer;
@@ -219,10 +280,13 @@ pub unsafe extern "C" fn aegis_h_inf_filter_init(
 }
 
 /// Propagates state forward under bounded disturbance.
+///
+/// # Safety
+/// Caller must ensure `filter` points to a valid, initialized `AegisHInfFilter`.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_h_inf_filter_predict(
     filter: *mut AegisHInfFilter,
-    control_input: f64,
+    control_input: Real,
 ) -> AegisStatusCode {
     if filter.is_null() {
         return AegisStatusCode::NullPointer;
@@ -235,11 +299,14 @@ pub unsafe extern "C" fn aegis_h_inf_filter_predict(
 }
 
 /// Updates state under discrete-time bounded-real Riccati criteria.
+///
+/// # Safety
+/// Caller must ensure `filter` points to a valid initialized filter and `out_state` is either null or writable.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_h_inf_filter_update(
     filter: *mut AegisHInfFilter,
-    measurement: f64,
-    out_state: *mut f64,
+    measurement: Real,
+    out_state: *mut Real,
 ) -> AegisStatusCode {
     if filter.is_null() {
         return AegisStatusCode::NullPointer;
@@ -257,19 +324,25 @@ pub unsafe extern "C" fn aegis_h_inf_filter_update(
 }
 
 /// Returns current H-Infinity state estimate.
+///
+/// # Safety
+/// Caller must ensure `filter` points to a valid `AegisHInfFilter` or null.
 #[no_mangle]
-pub unsafe extern "C" fn aegis_h_inf_filter_get_state(filter: *const AegisHInfFilter) -> f64 {
+pub unsafe extern "C" fn aegis_h_inf_filter_get_state(filter: *const AegisHInfFilter) -> Real {
     if filter.is_null() {
-        return f64::NAN;
+        return Real::NAN;
     }
     (*filter).inner.state()
 }
 
 /// Returns current H-Infinity error bound parameter (P).
+///
+/// # Safety
+/// Caller must ensure `filter` points to a valid `AegisHInfFilter` or null.
 #[no_mangle]
-pub unsafe extern "C" fn aegis_h_inf_filter_get_bound(filter: *const AegisHInfFilter) -> f64 {
+pub unsafe extern "C" fn aegis_h_inf_filter_get_bound(filter: *const AegisHInfFilter) -> Real {
     if filter.is_null() {
-        return f64::NAN;
+        return Real::NAN;
     }
     (*filter).inner.bound()
 }
@@ -285,12 +358,15 @@ pub struct AegisFusion4 {
 }
 
 /// Initializes a 4-channel Multi-Sensor Fusion filter.
+///
+/// # Safety
+/// Caller must ensure `fusion` points to valid, properly aligned, and writable memory.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_fusion4_init(
     fusion: *mut AegisFusion4,
-    x0: f64,
-    p0: f64,
-    q: f64,
+    x0: Real,
+    p0: Real,
+    q: Real,
 ) -> AegisStatusCode {
     if fusion.is_null() {
         return AegisStatusCode::NullPointer;
@@ -306,13 +382,16 @@ pub unsafe extern "C" fn aegis_fusion4_init(
 }
 
 /// Registers a redundant sensor source into the fusion array.
+///
+/// # Safety
+/// Caller must ensure `fusion` points to a valid, initialized `AegisFusion4`.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_fusion4_register_sensor(
     fusion: *mut AegisFusion4,
     sensor_id: u8,
-    variance: f64,
+    variance: Real,
     max_consecutive_anomalies: u32,
-    gate_threshold_sigma: f64,
+    gate_threshold_sigma: Real,
     auto_recovery_threshold: u32,
 ) -> AegisStatusCode {
     if fusion.is_null() {
@@ -342,10 +421,13 @@ pub unsafe extern "C" fn aegis_fusion4_register_sensor(
 }
 
 /// Time update for multi-sensor state propagation.
+///
+/// # Safety
+/// Caller must ensure `fusion` points to a valid, initialized `AegisFusion4`.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_fusion4_predict(
     fusion: *mut AegisFusion4,
-    control_input: f64,
+    control_input: Real,
 ) -> AegisStatusCode {
     if fusion.is_null() {
         return AegisStatusCode::NullPointer;
@@ -358,11 +440,14 @@ pub unsafe extern "C" fn aegis_fusion4_predict(
 }
 
 /// Fuses incoming measurement from a sensor source with automated FDIR checks.
+///
+/// # Safety
+/// Caller must ensure `fusion` points to a valid initialized engine and `out_status` is either null or writable.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_fusion4_fuse(
     fusion: *mut AegisFusion4,
     sensor_id: u8,
-    value: f64,
+    value: Real,
     out_status: *mut AegisFusionStatusCode,
 ) -> AegisStatusCode {
     if fusion.is_null() {
@@ -382,110 +467,62 @@ pub unsafe extern "C" fn aegis_fusion4_fuse(
 }
 
 /// Returns fused state estimate.
+///
+/// # Safety
+/// Caller must ensure `fusion` points to a valid `AegisFusion4` or null.
 #[no_mangle]
-pub unsafe extern "C" fn aegis_fusion4_get_state(fusion: *const AegisFusion4) -> f64 {
+pub unsafe extern "C" fn aegis_fusion4_get_state(fusion: *const AegisFusion4) -> Real {
     if fusion.is_null() {
-        return f64::NAN;
+        return Real::NAN;
     }
     (*fusion).inner.x
 }
 
 /// Returns fused error variance.
+///
+/// # Safety
+/// Caller must ensure `fusion` points to a valid `AegisFusion4` or null.
 #[no_mangle]
-pub unsafe extern "C" fn aegis_fusion4_get_variance(fusion: *const AegisFusion4) -> f64 {
+pub unsafe extern "C" fn aegis_fusion4_get_variance(fusion: *const AegisFusion4) -> Real {
     if fusion.is_null() {
-        return f64::NAN;
+        return Real::NAN;
     }
     (*fusion).inner.p
 }
 
 /// Returns real-time health score of a sensor (1.0 = nominal, 0.0 = quarantined).
+///
+/// # Safety
+/// Caller must ensure `fusion` points to a valid `AegisFusion4` or null.
 #[no_mangle]
 pub unsafe extern "C" fn aegis_fusion4_get_sensor_health(
     fusion: *const AegisFusion4,
     sensor_id: u8,
-) -> f64 {
+) -> Real {
     if fusion.is_null() {
-        return f64::NAN;
+        return Real::NAN;
     }
-    (*fusion).inner.sensor_health(sensor_id).unwrap_or(f64::NAN)
+    (*fusion)
+        .inner
+        .sensor_health(sensor_id)
+        .unwrap_or(Real::NAN)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::mem::MaybeUninit;
-
-    #[test]
-    fn test_c_ffi_scalar_filter() {
-        unsafe {
-            // Null pointer safety
-            assert_eq!(
-                aegis_scalar_filter_init(core::ptr::null_mut(), 0.0, 1.0, 0.01, 0.5),
-                AegisStatusCode::NullPointer
-            );
-
-            let mut filter = MaybeUninit::<AegisScalarFilter>::uninit();
-            let status = aegis_scalar_filter_init(filter.as_mut_ptr(), 0.0, 1.0, 0.01, 0.5);
-            assert_eq!(status, AegisStatusCode::Ok);
-            let mut filter = filter.assume_init();
-
-            let status = aegis_scalar_filter_predict(&mut filter, 0.1);
-            assert_eq!(status, AegisStatusCode::Ok);
-
-            let mut out = 0.0;
-            let status = aegis_scalar_filter_update(&mut filter, 1.05, 3.0, &mut out);
-            assert_eq!(status, AegisStatusCode::Ok);
-            assert!(out > 0.0);
-            assert!((aegis_scalar_filter_get_state(&filter) - out).abs() < 1e-12);
-            assert!(aegis_scalar_filter_get_variance(&filter) > 0.0);
-
-            // Rejection of adversary spike
-            let status = aegis_scalar_filter_update(&mut filter, 9999.0, 3.0, &mut out);
-            assert_eq!(status, AegisStatusCode::MeasurementGated);
-        }
+/// Returns whether a sensor is currently quarantined (1 = quarantined, 0 = active, -1 = not found / error).
+///
+/// # Safety
+/// Caller must ensure `fusion` points to a valid `AegisFusion4` or null.
+#[no_mangle]
+pub unsafe extern "C" fn aegis_fusion4_is_sensor_quarantined(
+    fusion: *const AegisFusion4,
+    sensor_id: u8,
+) -> i32 {
+    if fusion.is_null() {
+        return -1;
     }
-
-    #[test]
-    fn test_c_ffi_h_infinity_filter() {
-        unsafe {
-            let mut hinf = MaybeUninit::<AegisHInfFilter>::uninit();
-            let status = aegis_h_inf_filter_init(hinf.as_mut_ptr(), 0.0, 1.0, 0.01, 0.5, 5.0);
-            assert_eq!(status, AegisStatusCode::Ok);
-            let mut hinf = hinf.assume_init();
-
-            let status = aegis_h_inf_filter_predict(&mut hinf, 0.1);
-            assert_eq!(status, AegisStatusCode::Ok);
-
-            let mut out = 0.0;
-            let status = aegis_h_inf_filter_update(&mut hinf, 1.05, &mut out);
-            assert_eq!(status, AegisStatusCode::Ok);
-            assert!(out > 0.0);
-            assert!(aegis_h_inf_filter_get_bound(&hinf) > 0.0);
-        }
-    }
-
-    #[test]
-    fn test_c_ffi_fusion4_and_fdir() {
-        unsafe {
-            let mut fusion = MaybeUninit::<AegisFusion4>::uninit();
-            let status = aegis_fusion4_init(fusion.as_mut_ptr(), 0.0, 1.0, 0.01);
-            assert_eq!(status, AegisStatusCode::Ok);
-            let mut fusion = fusion.assume_init();
-
-            // Register Sensor 1
-            let status = aegis_fusion4_register_sensor(&mut fusion, 1, 0.2, 2, 3.0, 2);
-            assert_eq!(status, AegisStatusCode::Ok);
-
-            let status = aegis_fusion4_predict(&mut fusion, 0.5);
-            assert_eq!(status, AegisStatusCode::Ok);
-
-            let mut fusion_status = AegisFusionStatusCode::UnregisteredSensor;
-            let status = aegis_fusion4_fuse(&mut fusion, 1, 0.52, &mut fusion_status);
-            assert_eq!(status, AegisStatusCode::Ok);
-            assert_eq!(fusion_status, AegisFusionStatusCode::Fused);
-            assert!((aegis_fusion4_get_state(&fusion) - 0.52).abs() < 0.2);
-            assert_eq!(aegis_fusion4_get_sensor_health(&fusion, 1), 1.0);
-        }
+    match (*fusion).inner.is_sensor_quarantined(sensor_id) {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
     }
 }

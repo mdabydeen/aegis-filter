@@ -1,5 +1,24 @@
 //! Core mathematical types, errors, and `#![no_std]` floating point helpers.
 
+#[cfg(not(feature = "single-precision"))]
+/// Type alias for floating-point precision used across aegis-filter (f64 default).
+pub type Real = f64;
+
+#[cfg(feature = "single-precision")]
+/// Type alias for floating-point precision used across aegis-filter (f32 for single-precision FPUs).
+pub type Real = f32;
+
+/// Standard recommended 3-sigma innovation threshold for outlier and anomaly rejection.
+pub const DEFAULT_OUTLIER_GATE_SIGMA: Real = 3.0;
+
+#[cfg(not(feature = "single-precision"))]
+/// Standard maximum condition number threshold for double-precision covariance matrices (10^12).
+pub const DEFAULT_MAX_CONDITION_NUMBER: Real = 1e12;
+
+#[cfg(feature = "single-precision")]
+/// Standard maximum condition number threshold for single-precision covariance matrices (10^6).
+pub const DEFAULT_MAX_CONDITION_NUMBER: Real = 1e6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FilterError {
@@ -47,11 +66,11 @@ impl core::fmt::Display for FilterError {
 #[cfg(feature = "std")]
 impl std::error::Error for FilterError {}
 
-/// Trait providing safe, deterministic `#![no_std]` math operations for f64.
+/// Trait providing safe, deterministic `#![no_std]` math operations for floating-point types.
 pub trait FloatOps {
     fn is_valid_float(&self) -> bool;
-    fn abs_val(self) -> f64;
-    fn sqrt_val(self) -> f64;
+    fn abs_val(self) -> Self;
+    fn sqrt_val(self) -> Self;
 }
 
 impl FloatOps for f64 {
@@ -79,11 +98,55 @@ impl FloatOps for f64 {
             if !self.is_finite() {
                 return self;
             }
-            let mut curr = self;
-            for _ in 0..24 {
+            // Fast IEEE-754 exponent halving initial guess: accurate to within ~2% across
+            // the full dynamic range (1e-308 to 1e308), followed by quadratic Newton-Raphson.
+            let init_bits = (self.to_bits() >> 1) + (1023u64 << 51);
+            let mut curr = f64::from_bits(init_bits);
+            for _ in 0..8 {
                 let prev = curr;
                 curr = 0.5 * (curr + self / curr);
                 if (curr - prev).abs_val() <= 1e-15 * curr {
+                    break;
+                }
+            }
+            curr
+        }
+    }
+}
+
+impl FloatOps for f32 {
+    #[inline(always)]
+    fn is_valid_float(&self) -> bool {
+        self.is_finite()
+    }
+
+    #[inline(always)]
+    fn abs_val(self) -> f32 {
+        f32::from_bits(self.to_bits() & !(1u32 << 31))
+    }
+
+    #[inline]
+    fn sqrt_val(self) -> f32 {
+        #[cfg(feature = "std")]
+        {
+            self.sqrt()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            if self <= 0.0 {
+                return 0.0;
+            }
+            if !self.is_finite() {
+                return self;
+            }
+            // Fast IEEE-754 single-precision exponent halving initial guess,
+            // followed by quadratic Newton-Raphson iterations.
+            let init_bits = (self.to_bits() >> 1) + (127u32 << 22);
+            let mut curr = f32::from_bits(init_bits);
+            for _ in 0..6 {
+                let prev = curr;
+                curr = 0.5 * (curr + self / curr);
+                if (curr - prev).abs_val() <= 1e-6 * curr {
                     break;
                 }
             }

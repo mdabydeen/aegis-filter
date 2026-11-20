@@ -5,7 +5,7 @@
 //!
 //! Formulated for `#![no_std]` execution without heap allocations using compile-time const generics.
 
-use crate::common::{FilterError, FloatOps};
+use crate::common::{FilterError, FloatOps, Real};
 
 /// 2-State / 1-Measurement Unscented Kalman Filter.
 ///
@@ -29,31 +29,31 @@ use crate::common::{FilterError, FloatOps};
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UnscentedKalmanFilter2D {
-    /// State mean [x0, x1]
-    pub x: [f64; 2],
-    /// State covariance [2x2]
-    pub p: [[f64; 2]; 2],
-    /// Process noise covariance [2x2]
-    pub q: [[f64; 2]; 2],
+    /// State mean `[x0, x1]`
+    pub x: [Real; 2],
+    /// State covariance `[2x2]`
+    pub p: [[Real; 2]; 2],
+    /// Process noise covariance `[2x2]`
+    pub q: [[Real; 2]; 2],
     /// Measurement noise variance (R)
-    pub r: f64,
+    pub r: Real,
 
     // Merwe scaled unscented transform parameters:
-    alpha: f64,
-    beta: f64,
-    kappa: f64,
+    alpha: Real,
+    beta: Real,
+    kappa: Real,
 }
 
 /// Sigma points container: (weights_mean, weights_cov, points)
-pub type SigmaPoints2D = ([f64; 5], [f64; 5], [[f64; 2]; 5]);
+pub type SigmaPoints2D = ([Real; 5], [Real; 5], [[Real; 2]; 5]);
 
 impl UnscentedKalmanFilter2D {
     /// Initializes a new 2D Unscented Kalman Filter.
     pub fn new(
-        initial_x: [f64; 2],
-        initial_p: [[f64; 2]; 2],
-        q: [[f64; 2]; 2],
-        r: f64,
+        initial_x: [Real; 2],
+        initial_p: [[Real; 2]; 2],
+        q: [[Real; 2]; 2],
+        r: Real,
     ) -> Result<Self, FilterError> {
         if !initial_x[0].is_finite()
             || !initial_x[1].is_finite()
@@ -126,38 +126,40 @@ impl UnscentedKalmanFilter2D {
     }
 
     /// Predicts the state forward through an arbitrary non-linear dynamic transition function `f(x, dt)`.
-    pub fn predict<F>(&mut self, dt: f64, mut transition_fn: F) -> Result<(), FilterError>
+    pub fn predict<F>(&mut self, dt: Real, mut transition_fn: F) -> Result<(), FilterError>
     where
-        F: FnMut([f64; 2], f64) -> [f64; 2],
+        F: FnMut([Real; 2], Real) -> [Real; 2],
     {
         let (wm, wc, sigma_points) = self.generate_sigma_points()?;
 
         // Propagate sigma points through the non-linear dynamics
         let mut propagated_points = [[0.0; 2]; 5];
-        for i in 0..5 {
-            propagated_points[i] = transition_fn(sigma_points[i], dt);
-            if !propagated_points[i][0].is_finite() || !propagated_points[i][1].is_finite() {
+        for (dst, &pt) in propagated_points.iter_mut().zip(sigma_points.iter()) {
+            let out = transition_fn(pt, dt);
+            if !out[0].is_finite() || !out[1].is_finite() {
                 return Err(FilterError::NonFiniteInput);
             }
+            *dst = out;
         }
 
         // Compute predicted mean: x_pred = sum(wm[i] * chi[i])
-        let mut x_pred = [0.0; 2];
-        for i in 0..5 {
-            x_pred[0] += wm[i] * propagated_points[i][0];
-            x_pred[1] += wm[i] * propagated_points[i][1];
-        }
+        let x_pred = propagated_points
+            .iter()
+            .zip(wm.iter())
+            .fold([0.0, 0.0], |acc, (pt, &w)| {
+                [acc[0] + w * pt[0], acc[1] + w * pt[1]]
+            });
 
         // Compute predicted covariance: P_pred = sum(wc[i] * (chi[i] - x_pred) * (chi[i] - x_pred)^T) + Q
         let mut p_pred = [[0.0; 2]; 2];
-        for i in 0..5 {
-            let dx0 = propagated_points[i][0] - x_pred[0];
-            let dx1 = propagated_points[i][1] - x_pred[1];
+        for (pt, &w) in propagated_points.iter().zip(wc.iter()) {
+            let dx0 = pt[0] - x_pred[0];
+            let dx1 = pt[1] - x_pred[1];
 
-            p_pred[0][0] += wc[i] * dx0 * dx0;
-            p_pred[0][1] += wc[i] * dx0 * dx1;
-            p_pred[1][0] += wc[i] * dx1 * dx0;
-            p_pred[1][1] += wc[i] * dx1 * dx1;
+            p_pred[0][0] += w * dx0 * dx0;
+            p_pred[0][1] += w * dx0 * dx1;
+            p_pred[1][0] += w * dx1 * dx0;
+            p_pred[1][1] += w * dx1 * dx1;
         }
 
         p_pred[0][0] += self.q[0][0];
@@ -178,12 +180,12 @@ impl UnscentedKalmanFilter2D {
     /// Measurement update through an arbitrary non-linear observation function `h(x) -> scalar`.
     pub fn update<H>(
         &mut self,
-        measurement: f64,
+        measurement: Real,
         mut observe_fn: H,
-        gate_sigma: Option<f64>,
-    ) -> Result<[f64; 2], FilterError>
+        gate_sigma: Option<Real>,
+    ) -> Result<[Real; 2], FilterError>
     where
-        H: FnMut([f64; 2]) -> f64,
+        H: FnMut([Real; 2]) -> Real,
     {
         if !measurement.is_finite() {
             return Err(FilterError::NonFiniteInput);
@@ -193,24 +195,25 @@ impl UnscentedKalmanFilter2D {
 
         // Map sigma points into measurement space
         let mut gamma = [0.0; 5];
-        for i in 0..5 {
-            gamma[i] = observe_fn(sigma_points[i]);
-            if !gamma[i].is_finite() {
+        for (dst, &pt) in gamma.iter_mut().zip(sigma_points.iter()) {
+            let g = observe_fn(pt);
+            if !g.is_finite() {
                 return Err(FilterError::NonFiniteInput);
             }
+            *dst = g;
         }
 
         // Predicted measurement: z_pred = sum(wm[i] * gamma[i])
-        let mut z_pred = 0.0;
-        for i in 0..5 {
-            z_pred += wm[i] * gamma[i];
-        }
+        let z_pred = gamma
+            .iter()
+            .zip(wm.iter())
+            .fold(0.0, |acc, (&g, &w)| acc + w * g);
 
         // Innovation covariance: S = sum(wc[i] * (gamma[i] - z_pred)^2) + R
         let mut s = self.r;
-        for i in 0..5 {
-            let dz = gamma[i] - z_pred;
-            s += wc[i] * dz * dz;
+        for (&g, &w) in gamma.iter().zip(wc.iter()) {
+            let dz = g - z_pred;
+            s += w * dz * dz;
         }
 
         if s <= 1e-15 || !s.is_finite() {
@@ -232,13 +235,11 @@ impl UnscentedKalmanFilter2D {
 
         // Cross-covariance: P_xz = sum(wc[i] * (chi[i] - x) * (gamma[i] - z_pred))
         let mut p_xz = [0.0; 2];
-        for i in 0..5 {
-            let dx0 = sigma_points[i][0] - self.x[0];
-            let dx1 = sigma_points[i][1] - self.x[1];
-            let dz = gamma[i] - z_pred;
+        for (&pt, (&g, &w)) in sigma_points.iter().zip(gamma.iter().zip(wc.iter())) {
+            let dz = g - z_pred;
 
-            p_xz[0] += wc[i] * dx0 * dz;
-            p_xz[1] += wc[i] * dx1 * dz;
+            p_xz[0] += w * (pt[0] - self.x[0]) * dz;
+            p_xz[1] += w * (pt[1] - self.x[1]) * dz;
         }
 
         // Kalman Gain: K = P_xz / S
@@ -266,6 +267,34 @@ impl UnscentedKalmanFilter2D {
             self.p[1][1] = 1e-15;
         }
 
+        // Cauchy-Schwarz covariance bound: |P_01| <= (1 - 1e-12) * sqrt(P_00 * P_11)
+        // Mathematically guarantees det(P) > 0, preventing Cholesky failure in the next cycle.
+        let max_cov = (self.p[0][0] * self.p[1][1]).sqrt_val() * (1.0 - 1e-12);
+        if self.p[0][1].abs_val() > max_cov {
+            let sign = if self.p[0][1] >= 0.0 { 1.0 } else { -1.0 };
+            self.p[0][1] = sign * max_cov;
+            self.p[1][0] = sign * max_cov;
+        }
+
         Ok(self.x)
+    }
+
+    /// Computes the 1-norm numerical condition number $\kappa_1(P)$ of the 2x2 state covariance matrix.
+    #[inline]
+    pub fn condition_number(&self) -> Result<Real, FilterError> {
+        crate::linear::matrix_condition_number(&self.p)
+    }
+
+    /// Checks whether the 2x2 state covariance is well-conditioned against a specified threshold.
+    #[inline]
+    pub fn check_conditioning(&self, max_condition_number: Real) -> Result<Real, FilterError> {
+        crate::linear::check_matrix_conditioning(&self.p, max_condition_number)
+    }
+
+    /// Quick boolean check whether state covariance is well-conditioned against [`crate::DEFAULT_MAX_CONDITION_NUMBER`].
+    #[inline]
+    pub fn is_well_conditioned(&self) -> bool {
+        self.check_conditioning(crate::DEFAULT_MAX_CONDITION_NUMBER)
+            .is_ok()
     }
 }

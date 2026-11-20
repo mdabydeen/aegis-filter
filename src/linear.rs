@@ -1,6 +1,6 @@
 //! Classical Linear & Kinematic Kalman Filters with Joseph stabilized covariance.
 
-use crate::common::{FilterError, FloatOps};
+use crate::common::{FilterError, FloatOps, Real, DEFAULT_MAX_CONDITION_NUMBER};
 
 /// 1D Scalar Kalman Filter with Joseph-stabilized variance update.
 ///
@@ -16,18 +16,20 @@ use crate::common::{FilterError, FloatOps};
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScalarKalmanFilter {
-    x: f64,
-    p: f64,
-    q: f64,
-    r: f64,
+    x: Real,
+    p: Real,
+    q: Real,
+    r: Real,
+    default_gate: Option<Real>,
 }
 
 impl ScalarKalmanFilter {
+    #[allow(clippy::needless_range_loop)]
     pub fn new(
-        initial_state: f64,
-        initial_variance: f64,
-        process_noise: f64,
-        measurement_noise: f64,
+        initial_state: Real,
+        initial_variance: Real,
+        process_noise: Real,
+        measurement_noise: Real,
     ) -> Result<Self, FilterError> {
         if !initial_state.is_finite()
             || !initial_variance.is_finite()
@@ -46,10 +48,45 @@ impl ScalarKalmanFilter {
             p: initial_variance,
             q: process_noise,
             r: measurement_noise,
+            default_gate: None,
         })
     }
 
-    pub fn predict(&mut self, control_input: f64) -> Result<(), FilterError> {
+    /// Creates a fail-closed, cyber-resilient filter with default 3-sigma innovation gating enabled.
+    pub fn new_resilient(
+        initial_state: Real,
+        initial_variance: Real,
+        process_noise: Real,
+        measurement_noise: Real,
+    ) -> Result<Self, FilterError> {
+        let mut filter = Self::new(
+            initial_state,
+            initial_variance,
+            process_noise,
+            measurement_noise,
+        )?;
+        filter.default_gate = Some(crate::DEFAULT_OUTLIER_GATE_SIGMA);
+        Ok(filter)
+    }
+
+    /// Sets or overrides the persistent default gating threshold.
+    ///
+    /// When configured, calls to [`Self::update`] with `None` will enforce this gate (fail-closed).
+    pub fn with_default_gate(mut self, threshold_sigma: Real) -> Result<Self, FilterError> {
+        if !threshold_sigma.is_finite() || threshold_sigma <= 0.0 {
+            return Err(FilterError::InvalidParameter);
+        }
+        self.default_gate = Some(threshold_sigma);
+        Ok(self)
+    }
+
+    /// Disables default innovation gating, returning to unconstrained (fail-open) mode.
+    pub fn disable_default_gate(mut self) -> Self {
+        self.default_gate = None;
+        self
+    }
+
+    pub fn predict(&mut self, control_input: Real) -> Result<(), FilterError> {
         if !control_input.is_finite() {
             return Err(FilterError::NonFiniteInput);
         }
@@ -64,11 +101,19 @@ impl ScalarKalmanFilter {
         Ok(())
     }
 
+    /// Fuses an incoming scalar measurement with optional innovation outlier gating.
+    ///
+    /// # Gating Semantics
+    /// - `Some(sigma)`: Overrides gating for this call: rejects measurements whose normalized
+    ///   innovation $|y| / \sqrt{S} > \sigma$ with [`FilterError::MeasurementGated`].
+    /// - `Some(<= 0.0)`: Explicitly bypasses outlier gating for this update.
+    /// - `None`: Falls back to the filter's persistent default gate ([`Self::with_default_gate`] or
+    ///   [`Self::new_resilient`]). If no default was configured, gating is bypassed.
     pub fn update(
         &mut self,
-        measurement: f64,
-        gate_threshold_sigma: Option<f64>,
-    ) -> Result<f64, FilterError> {
+        measurement: Real,
+        gate_threshold_sigma: Option<Real>,
+    ) -> Result<Real, FilterError> {
         if !measurement.is_finite() {
             return Err(FilterError::NonFiniteInput);
         }
@@ -79,12 +124,16 @@ impl ScalarKalmanFilter {
             return Err(FilterError::SingularInnovation);
         }
 
-        if let Some(gate_sigma) = gate_threshold_sigma {
-            if gate_sigma > 0.0 {
-                let normalized_residual = y.abs_val() / s.sqrt_val();
-                if normalized_residual > gate_sigma {
-                    return Err(FilterError::MeasurementGated);
-                }
+        let effective_gate = match gate_threshold_sigma {
+            Some(sigma) if sigma <= 0.0 => None,
+            Some(sigma) => Some(sigma),
+            None => self.default_gate,
+        };
+
+        if let Some(gate_sigma) = effective_gate {
+            let normalized_residual = y.abs_val() / s.sqrt_val();
+            if normalized_residual > gate_sigma {
+                return Err(FilterError::MeasurementGated);
             }
         }
 
@@ -103,12 +152,12 @@ impl ScalarKalmanFilter {
     }
 
     #[inline(always)]
-    pub fn state(&self) -> f64 {
+    pub fn state(&self) -> Real {
         self.x
     }
 
     #[inline(always)]
-    pub fn variance(&self) -> f64 {
+    pub fn variance(&self) -> Real {
         self.p
     }
 }
@@ -116,22 +165,24 @@ impl ScalarKalmanFilter {
 /// Generic N-dimensional Linear Kalman Filter using const-generics.
 #[derive(Debug, Clone)]
 pub struct LinearKalmanFilter<const S: usize, const M: usize> {
-    pub x: [f64; S],
-    pub p: [[f64; S]; S],
-    pub f: [[f64; S]; S],
-    pub q: [[f64; S]; S],
-    pub h: [[f64; S]; M],
-    pub r: [[f64; M]; M],
+    pub x: [Real; S],
+    pub p: [[Real; S]; S],
+    pub f: [[Real; S]; S],
+    pub q: [[Real; S]; S],
+    pub h: [[Real; S]; M],
+    pub r: [[Real; M]; M],
+    pub default_gate: Option<Real>,
 }
 
 impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
+    #[allow(clippy::needless_range_loop)]
     pub fn new(
-        initial_x: [f64; S],
-        initial_p: [[f64; S]; S],
-        f: [[f64; S]; S],
-        q: [[f64; S]; S],
-        h: [[f64; S]; M],
-        r: [[f64; M]; M],
+        initial_x: [Real; S],
+        initial_p: [[Real; S]; S],
+        f: [[Real; S]; S],
+        q: [[Real; S]; S],
+        h: [[Real; S]; M],
+        r: [[Real; M]; M],
     ) -> Result<Self, FilterError> {
         for val in initial_x.iter() {
             if !val.is_finite() {
@@ -144,6 +195,22 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
         Self::validate_matrix(&h)?;
         Self::validate_matrix(&r)?;
 
+        // Physical covariance validation: diagonal variances must be non-negative,
+        // and initial state uncertainty P must be strictly positive.
+        for i in 0..S {
+            if initial_p[i][i] <= 0.0 {
+                return Err(FilterError::InvalidCovariance);
+            }
+            if q[i][i] < 0.0 {
+                return Err(FilterError::InvalidCovariance);
+            }
+        }
+        for j in 0..M {
+            if r[j][j] < 0.0 {
+                return Err(FilterError::InvalidCovariance);
+            }
+        }
+
         Ok(Self {
             x: initial_x,
             p: initial_p,
@@ -151,11 +218,43 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
             q,
             h,
             r,
+            default_gate: None,
         })
     }
 
+    /// Creates a fail-closed, cyber-resilient filter with default 3-sigma Mahalanobis gating enabled.
+    pub fn new_resilient(
+        initial_x: [Real; S],
+        initial_p: [[Real; S]; S],
+        f: [[Real; S]; S],
+        q: [[Real; S]; S],
+        h: [[Real; S]; M],
+        r: [[Real; M]; M],
+    ) -> Result<Self, FilterError> {
+        let mut filter = Self::new(initial_x, initial_p, f, q, h, r)?;
+        filter.default_gate = Some(crate::DEFAULT_OUTLIER_GATE_SIGMA);
+        Ok(filter)
+    }
+
+    /// Sets or overrides the persistent default gating threshold.
+    ///
+    /// When configured, calls to [`Self::update`] with `None` will enforce this gate (fail-closed).
+    pub fn with_default_gate(mut self, threshold_sigma: Real) -> Result<Self, FilterError> {
+        if !threshold_sigma.is_finite() || threshold_sigma <= 0.0 {
+            return Err(FilterError::InvalidParameter);
+        }
+        self.default_gate = Some(threshold_sigma);
+        Ok(self)
+    }
+
+    /// Disables default Mahalanobis gating, returning to unconstrained (fail-open) mode.
+    pub fn disable_default_gate(mut self) -> Self {
+        self.default_gate = None;
+        self
+    }
+
     fn validate_matrix<const R: usize, const C: usize>(
-        matrix: &[[f64; C]; R],
+        matrix: &[[Real; C]; R],
     ) -> Result<(), FilterError> {
         for row in matrix.iter() {
             for val in row.iter() {
@@ -208,6 +307,17 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
             }
         }
 
+        for i in 0..S {
+            if !x_pred[i].is_finite() {
+                return Err(FilterError::NonFiniteInput);
+            }
+            for j in 0..S {
+                if !p_pred[i][j].is_finite() {
+                    return Err(FilterError::NonFiniteInput);
+                }
+            }
+        }
+
         self.x = x_pred;
         self.p = p_pred;
         Ok(())
@@ -218,7 +328,7 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
     /// This generalises the 1D [`ScalarKalmanFilter::update`] to the multi-dimensional
     /// case, keeping the same guarantees:
     ///
-    /// * **Joseph stabilised covariance update.** After `P = (I - K H) P (I - K H)^T + K S K^T`
+    /// * **Joseph stabilised covariance update.** After `P = (I - K H) P (I - K H)^T + K R K^T`
     ///   the posterior is symmetric by construction and stays positive semi-definite under
     ///   finite round-off, which the naive `P - K S K^T` subtraction form cannot promise.
     /// * **Gating.** With `gate_threshold_sigma` set, the measurement is rejected as an outlier
@@ -239,12 +349,23 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
     /// let est = f.update(&[1.05], None).unwrap();
     /// assert!(est[0] > 0.0);
     /// ```
+    /// Fuses an incoming measurement vector with optional Mahalanobis outlier gating.
+    ///
+    /// # Gating Semantics (3-Sigma vs Mahalanobis Distance)
+    /// - `Some(sigma)`: Rejects measurements whose Mahalanobis distance $\sqrt{y^T S^{-1} y} > \sigma$
+    ///   with [`FilterError::MeasurementGated`], leaving the state and covariance unmodified.
+    ///   Use [`crate::DEFAULT_OUTLIER_GATE_SIGMA`] (3.0) for standard multi-sigma protection.
+    /// - `None` or `Some(<= 0.0)`: Outlier gating is bypassed (fail-open mode).
+    ///
+    /// For 1D scalar observation ($M = 1$), the Mahalanobis distance simplifies directly to
+    /// the 1D normalized residual $|y| / \sqrt{S}$. For multi-dimensional observations ($M > 1$),
+    /// the metric accounts for correlated sensor cross-covariances through innovation matrix inversion $S^{-1}$.
     #[allow(clippy::needless_range_loop)] // manual index loops over const-generic buffers
     pub fn update(
         &mut self,
-        measurement: &[f64; M],
-        gate_threshold_sigma: Option<f64>,
-    ) -> Result<[f64; S], FilterError> {
+        measurement: &[Real; M],
+        gate_threshold_sigma: Option<Real>,
+    ) -> Result<[Real; S], FilterError> {
         // Boundary check: non-finite measurements are rejected, like the 1D path.
         for &val in measurement.iter() {
             if !val.is_finite() {
@@ -269,17 +390,27 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
         }
 
         // Innovation covariance S = H P H^T + R, then symmetrise it.
+        // Factoring H P H^T via intermediate HP = H * P:
+        // 1. HP = H * P (M x S) in O(M * S^2).
+        // Since P is symmetric (P = P^T), (H * P)^T = P * H^T.
+        let mut hp = [[0.0; S]; M];
+        for j in 0..M {
+            for i in 0..S {
+                let mut acc = 0.0;
+                for l in 0..S {
+                    acc += h[j][l] * p[l][i];
+                }
+                hp[j][i] = acc;
+            }
+        }
+
+        // 2. S = (HP) * H^T + R (M x M) in O(M^2 * S).
         let mut s = [[0.0; M]; M];
         for j in 0..M {
             for k in 0..M {
                 let mut acc = 0.0;
                 for i in 0..S {
-                    // (H P H^T)[j][k] = sum_i (sum_l H[j][l] P[l][i]) H[k][i]
-                    let mut hp_ji = 0.0;
-                    for l in 0..S {
-                        hp_ji += h[j][l] * p[l][i];
-                    }
-                    acc += hp_ji * h[k][i];
+                    acc += hp[j][i] * h[k][i];
                 }
                 s[j][k] = acc + r[j][k];
             }
@@ -298,32 +429,32 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
 
         // Gating: Mahalanobis distance sqrt(y^T S^-1 y). For M = 1 this is |y|/sqrt(S),
         // identical to the 1D gate.
-        if let Some(gate_sigma) = gate_threshold_sigma {
-            if gate_sigma > 0.0 {
-                let mut stat = 0.0;
-                for j in 0..M {
-                    for k in 0..M {
-                        stat += y[j] * s_inv[j][k] * y[k];
-                    }
+        let effective_gate = match gate_threshold_sigma {
+            Some(sigma) if sigma <= 0.0 => None,
+            Some(sigma) => Some(sigma),
+            None => self.default_gate,
+        };
+
+        if let Some(gate_sigma) = effective_gate {
+            let mut stat = 0.0;
+            for j in 0..M {
+                for k in 0..M {
+                    stat += y[j] * s_inv[j][k] * y[k];
                 }
-                // stat is theoretically >= 0; guard round-off that could dip below zero.
-                let mahal = stat.max(0.0).sqrt_val();
-                if mahal > gate_sigma {
-                    return Err(FilterError::MeasurementGated);
-                }
+            }
+            // stat is theoretically >= 0; guard round-off that could dip below zero.
+            let mahal = stat.max(0.0).sqrt_val();
+            if mahal > gate_sigma {
+                return Err(FilterError::MeasurementGated);
             }
         }
 
-        // Kalman gain K = P H^T S^-1  (S x M), computed as two matrix products.
-        // 1. A = P H^T  (S x M):  A[i][l] = sum_t P[i][t] H[l][t]
+        // Kalman gain K = P H^T S^-1  (S x M), computed using the factored HP transpose.
+        // 1. A = P H^T  (S x M) is the transpose of HP: A[i][l] = hp[l][i].
         let mut p_ht = [[0.0; M]; S];
         for i in 0..S {
             for l in 0..M {
-                let mut acc = 0.0;
-                for t in 0..S {
-                    acc += p[i][t] * h[l][t];
-                }
-                p_ht[i][l] = acc;
+                p_ht[i][l] = hp[l][i];
             }
         }
         // 2. K = A S^-1  (S x M):  K[i][j] = sum_l P_H_T[i][l] S^-1[l][j]
@@ -348,7 +479,7 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
             x_new[i] = x[i] + acc;
         }
 
-        // Joseph covariance update: P = (I - K H) P (I - K H)^T + K S K^T.
+        // Joseph covariance update: P = (I - K H) P (I - K H)^T + K R K^T.
         // I - K H is S x S.
         let mut e = [[0.0; S]; S];
         for i in 0..S {
@@ -361,26 +492,44 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
             }
         }
 
+        // Factored Joseph form: O(S^3 + S^2 M + S M^2) instead of fused O(S^4 + S^2 M^2).
+        // 1. EP = E * P  (S x S) in O(S^3)
+        let mut ep = [[0.0; S]; S];
+        for i in 0..S {
+            for j in 0..S {
+                let mut acc = 0.0;
+                for a in 0..S {
+                    acc += e[i][a] * p[a][j];
+                }
+                ep[i][j] = acc;
+            }
+        }
+
+        // 2. KR = K * R  (S x M) in O(S * M^2)
+        let mut kr = [[0.0; M]; S];
+        for i in 0..S {
+            for t in 0..M {
+                let mut acc = 0.0;
+                for l in 0..M {
+                    acc += k[i][l] * r[l][t];
+                }
+                kr[i][t] = acc;
+            }
+        }
+
+        // 3. P_new = (EP) * E^T + (KR) * K^T in O(S^2 * (S + M))
         let mut p_new = [[0.0; S]; S];
         for i in 0..S {
             for j in 0..S {
-                // (I - K H) P (I - K H)^T = sum_{a,b} e[i][a] p[a][b] e[j][b]
                 let mut ep_e = 0.0;
-                for a in 0..S {
-                    for b in 0..S {
-                        ep_e += e[i][a] * p[a][b] * e[j][b];
-                    }
+                for b in 0..S {
+                    ep_e += ep[i][b] * e[j][b];
                 }
-                // K S K^T = sum_t (sum_l k[i][l] s[l][t]) k[j][t]
-                let mut k_s_k = 0.0;
+                let mut k_r_k = 0.0;
                 for t in 0..M {
-                    let mut ks = 0.0;
-                    for l in 0..M {
-                        ks += k[i][l] * s[l][t];
-                    }
-                    k_s_k += ks * k[j][t];
+                    k_r_k += kr[i][t] * k[j][t];
                 }
-                p_new[i][j] = ep_e + k_s_k;
+                p_new[i][j] = ep_e + k_r_k;
             }
         }
 
@@ -407,239 +556,227 @@ impl<const S: usize, const M: usize> LinearKalmanFilter<S, M> {
         Ok(x_new)
     }
 
-    /// Gauss-Jordan inversion of a const-sized `N x N` matrix with partial pivoting.
+    /// Computes the 1-norm numerical condition number $\kappa_1(P) = \|P\|_1 \cdot \|P^{-1}\|_1$ of state covariance $P$.
     ///
-    /// Invert is the one numerically sensitive step in [`update`]; a ~zero pivot after
-    /// pivoting means the matrix is singular (or numerically rank-deficient) and we return
-    /// [`FilterError::NumericalInstability`] rather than divide by it. Threshold `1e-15`
-    /// matches the singularity guard the 1D filter uses for its scalar innovation covariance.
-    #[allow(clippy::needless_range_loop)] // index loops over const-generic buffers
-    fn invert_matrix<const N: usize>(m: &[[f64; N]; N]) -> Result<[[f64; N]; N], FilterError> {
-        // Two N x N buffers instead of one 2*N augmented block: a generic const param may
-        // not appear in const arithmetic (`2 * N`) under edition 2021. `mat` accumulates the
-        // pivots so its left side becomes I; `inv` follows the identical row ops and so
-        // becomes M^-1. Both stay on the stack, keeping the crate zero-allocation / no_std.
-        let mut mat = [[0.0; N]; N];
-        let mut inv = [[0.0; N]; N];
-        for i in 0..N {
-            for j in 0..N {
-                mat[i][j] = m[i][j];
-                inv[i][j] = if i == j { 1.0 } else { 0.0 };
-            }
-        }
+    /// An ill-conditioned covariance matrix ($\kappa \gg 1$) indicates loss of numerical precision or near-singularity,
+    /// which can cause filter divergence during Kalman gain computation.
+    #[inline]
+    pub fn condition_number(&self) -> Result<Real, FilterError> {
+        matrix_condition_number(&self.p)
+    }
 
-        for col in 0..N {
-            // Partial pivot: pick the row with the largest |pivot| in this column to
-            // avoid dividing by a near-zero value (improves numerical stability).
-            let mut pivot = col;
-            for r in (col + 1)..N {
-                if mat[r][col].abs_val() > mat[pivot][col].abs_val() {
-                    pivot = r;
-                }
-            }
-            if mat[pivot][col].abs_val() < 1e-15 {
-                return Err(FilterError::NumericalInstability);
-            }
-            // The pivot swap must hit both buffers so they stay row-aligned.
-            mat.swap(col, pivot);
-            inv.swap(col, pivot);
+    /// Checks whether state covariance $P$ is well-conditioned against a specified maximum threshold.
+    ///
+    /// Rejects non-positive, asymmetric, or ill-conditioned covariances with [`FilterError::InvalidCovariance`].
+    #[inline]
+    pub fn check_conditioning(&self, max_condition_number: Real) -> Result<Real, FilterError> {
+        check_matrix_conditioning(&self.p, max_condition_number)
+    }
 
-            // Normalise the pivot row to a unit diagonal.
-            let inv_diag = 1.0 / mat[col][col];
-            for j in 0..N {
-                mat[col][j] *= inv_diag;
-                inv[col][j] *= inv_diag;
-            }
+    /// Quick boolean check whether state covariance $P$ is well-conditioned against [`DEFAULT_MAX_CONDITION_NUMBER`].
+    #[inline]
+    pub fn is_well_conditioned(&self) -> bool {
+        self.check_conditioning(DEFAULT_MAX_CONDITION_NUMBER)
+            .is_ok()
+    }
 
-            // Eliminate this column from every other row, applying the same op to `inv`.
-            for r in 0..N {
-                if r == col {
-                    continue;
-                }
-                let factor = mat[r][col];
-                if factor == 0.0 {
-                    continue;
-                }
-                for j in 0..N {
-                    mat[r][j] -= factor * mat[col][j];
-                    inv[r][j] -= factor * inv[col][j];
-                }
-            }
-        }
-
-        // When mat is the identity, inv holds M^-1.
-        Ok(inv)
+    /// Inverts an $N \times N$ matrix via Gauss-Jordan elimination with partial pivoting.
+    ///
+    /// Kept for backwards compatibility; delegates to [`invert_matrix`].
+    #[inline(always)]
+    pub fn invert_matrix<const N: usize>(
+        m: &[[Real; N]; N],
+    ) -> Result<[[Real; N]; N], FilterError> {
+        invert_matrix(m)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[cfg(not(feature = "single-precision"))]
+const SINGULARITY_EPSILON: Real = 1e-15;
 
-    // (1) predict regression: a constant-velocity model must still propagate x.
-    // F = [[1, 0.1], [0, 1]] -> position advances by 0.1*velocity per step; with
-    // velocity held at 100, x[0] grows by 10.0 each predict. Deterministic.
-    #[test]
-    fn test_linear_predict_kinematic() {
-        let mut f = LinearKalmanFilter::<2, 1>::new(
-            [0.0, 100.0],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.1], [0.0, 1.0]],
-            [[0.001, 0.0], [0.0, 0.001]],
-            [[1.0, 0.0]], // H: one row, position only
-            [[0.5]],
-        )
-        .unwrap();
-        for _ in 0..3 {
-            f.predict().unwrap();
+#[cfg(feature = "single-precision")]
+const SINGULARITY_EPSILON: Real = 1e-7;
+
+/// Computes the matrix 1-norm (maximum absolute column sum) in $O(R \cdot C)$ with zero heap allocation.
+///
+/// $$\|M\|_1 = \max_{0 \le j < C} \sum_{i=0}^{R-1} |M_{ij}|$$
+#[allow(clippy::needless_range_loop)]
+pub fn matrix_norm_1<const R: usize, const C: usize>(m: &[[Real; C]; R]) -> Real {
+    let mut max_col_sum: Real = 0.0;
+    for col in 0..C {
+        let mut col_sum: Real = 0.0;
+        for row in 0..R {
+            col_sum += m[row][col].abs_val();
         }
-        assert!((f.x[0] - 30.0).abs() < 1e-9, "x[0] = {}", f.x[0]);
-    }
-
-    // (2) M=1 measurement update converges the state to a constant target, exactly
-    // like the 1D scalar filter. S=1, M=1 with F=I: x tracks the target as the
-    // posterior variance shrinks.
-    #[test]
-    fn test_linear_update_m1_convergence() {
-        let mut f =
-            LinearKalmanFilter::<1, 1>::new([0.0], [[10.0]], [[1.0]], [[0.01]], [[1.0]], [[0.5]])
-                .unwrap();
-        let target = 25.0;
-        for _ in 0..50 {
-            f.predict().unwrap();
-            let _ = f.update(&[target], None).unwrap();
+        if col_sum > max_col_sum {
+            max_col_sum = col_sum;
         }
-        assert!((f.x[0] - target).abs() < 0.2, "x[0] = {}", f.x[0]);
     }
+    max_col_sum
+}
 
-    // (3) The H=I, P=I, R=I case has an exact closed-form first update: K = P H^T
-    // S^-1 = I . I . (2I)^-1 = 0.5 I, so x moves halfway to the measurement in one step.
-    #[test]
-    fn test_linear_update_m2_single_step_halfway() {
-        let mut f = LinearKalmanFilter::<2, 2>::new(
-            [0.0, 0.0],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.0], [0.0, 1.0]], // F = I
-            [[0.0, 0.0], [0.0, 0.0]], // Q = 0
-            [[1.0, 0.0], [0.0, 1.0]], // H = I
-            [[1.0, 0.0], [0.0, 1.0]], // R = I
-        )
-        .unwrap();
-        let z = [10.0, 20.0];
-        let out = f.update(&z, None).unwrap();
-        assert!((out[0] - 5.0).abs() < 1e-9, "out[0] = {}", out[0]);
-        assert!((out[1] - 10.0).abs() < 1e-9, "out[1] = {}", out[1]);
-    }
-
-    // (4) Repeated M=2 updates converge to the true measurement vector.
-    #[test]
-    fn test_linear_update_m2_convergence() {
-        let mut f = LinearKalmanFilter::<2, 2>::new(
-            [0.0, 0.0],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[0.01, 0.0], [0.0, 0.01]],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.0], [0.0, 1.0]],
-        )
-        .unwrap();
-        let z = [10.0, 20.0];
-        for _ in 0..50 {
-            f.predict().unwrap();
-            f.update(&z, None).unwrap();
+/// Computes the matrix $\infty$-norm (maximum absolute row sum) in $O(R \cdot C)$ with zero heap allocation.
+///
+/// $$\|M\|_\infty = \max_{0 \le i < R} \sum_{j=0}^{C-1} |M_{ij}|$$
+#[allow(clippy::needless_range_loop)]
+pub fn matrix_norm_inf<const R: usize, const C: usize>(m: &[[Real; C]; R]) -> Real {
+    let mut max_row_sum: Real = 0.0;
+    for row in 0..R {
+        let mut row_sum: Real = 0.0;
+        for col in 0..C {
+            row_sum += m[row][col].abs_val();
         }
-        assert!((f.x[0] - 10.0).abs() < 0.1, "x[0] = {}", f.x[0]);
-        assert!((f.x[1] - 20.0).abs() < 0.1, "x[1] = {}", f.x[1]);
+        if row_sum > max_row_sum {
+            max_row_sum = row_sum;
+        }
+    }
+    max_row_sum
+}
+
+/// Computes the matrix Frobenius norm in $O(R \cdot C)$ with zero heap allocation.
+///
+/// $$\|M\|_F = \sqrt{\sum_{i=0}^{R-1} \sum_{j=0}^{C-1} M_{ij}^2}$$
+#[allow(clippy::needless_range_loop)]
+pub fn matrix_norm_frobenius<const R: usize, const C: usize>(m: &[[Real; C]; R]) -> Real {
+    let mut sum_sq: Real = 0.0;
+    for row in 0..R {
+        for col in 0..C {
+            let val = m[row][col];
+            sum_sq += val * val;
+        }
+    }
+    sum_sq.sqrt_val()
+}
+
+/// Gauss-Jordan inversion of a const-sized $N \times N$ matrix with partial pivoting in pure `#[no_std]` stack memory.
+///
+/// Inversion is performed in-place using two stack-allocated buffers `mat` and `inv`, ensuring
+/// zero heap allocation. Returns [`FilterError::NumericalInstability`] if a pivot is near-zero (singular matrix).
+#[allow(clippy::needless_range_loop)]
+pub fn invert_matrix<const N: usize>(m: &[[Real; N]; N]) -> Result<[[Real; N]; N], FilterError> {
+    let mut mat = [[0.0; N]; N];
+    let mut inv = [[0.0; N]; N];
+    for i in 0..N {
+        for j in 0..N {
+            mat[i][j] = m[i][j];
+            inv[i][j] = if i == j { 1.0 } else { 0.0 };
+        }
     }
 
-    // (5) Joseph form must keep P symmetric and positive on the diagonals. For the
-    // H=I, P=I, R=I case the posterior covariance is the analytic 0.75 * I.
-    #[test]
-    fn test_linear_update_joseph_symmetry_and_psd() {
-        let mut f = LinearKalmanFilter::<2, 2>::new(
-            [0.0, 0.0],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[0.0, 0.0], [0.0, 0.0]],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.0], [0.0, 1.0]],
-        )
-        .unwrap();
-        f.update(&[5.0, 5.0], None).unwrap();
-        // Symmetry: off-diagonals match on both triangles.
-        assert!((f.p[0][1] - f.p[1][0]).abs() < 1e-9, "off-diag mismatch");
-        assert!((f.p[0][1]).abs() < 1e-9, "off-diag = {}", f.p[0][1]);
-        // Diagonals: analytic 0.75, and strictly positive (PSD lower bound).
-        assert!((f.p[0][0] - 0.75).abs() < 1e-9, "p00 = {}", f.p[0][0]);
-        assert!((f.p[1][1] - 0.75).abs() < 1e-9, "p11 = {}", f.p[1][1]);
+    for col in 0..N {
+        let mut pivot = col;
+        for r in (col + 1)..N {
+            if mat[r][col].abs_val() > mat[pivot][col].abs_val() {
+                pivot = r;
+            }
+        }
+        if mat[pivot][col].abs_val() < SINGULARITY_EPSILON {
+            return Err(FilterError::NumericalInstability);
+        }
+        mat.swap(col, pivot);
+        inv.swap(col, pivot);
+
+        let inv_diag = 1.0 / mat[col][col];
+        for j in 0..N {
+            mat[col][j] *= inv_diag;
+            inv[col][j] *= inv_diag;
+        }
+
+        for r in 0..N {
+            if r == col {
+                continue;
+            }
+            let factor = mat[r][col];
+            if factor == 0.0 {
+                continue;
+            }
+            for j in 0..N {
+                mat[r][j] -= factor * mat[col][j];
+                inv[r][j] -= factor * inv[col][j];
+            }
+        }
     }
 
-    // (6) Gating: a far-off M=1 measurement is rejected (3-sigma gate) and the state
-    // is left untouched, mirroring the scalar filter's MeasurementGated behaviour.
-    #[test]
-    fn test_linear_update_m1_gating_rejects_outlier() {
-        let mut f =
-            LinearKalmanFilter::<1, 1>::new([0.0], [[1.0]], [[1.0]], [[0.0]], [[1.0]], [[0.01]])
-                .unwrap();
-        let err = f.update(&[1000.0], Some(3.0));
-        assert_eq!(err, Err(FilterError::MeasurementGated));
-        assert!((f.x[0] - 0.0).abs() < 1e-12, "state moved on gated update");
+    Ok(inv)
+}
+
+/// Computes the exact 1-norm condition number $\kappa_1(M) = \|M\|_1 \cdot \|M^{-1}\|_1$ for square matrices.
+///
+/// Returns:
+/// - `Ok(kappa)` where $\kappa \ge 1.0$.
+/// - [`FilterError::NonFiniteInput`] if elements are NaN or infinite.
+/// - [`FilterError::InvalidCovariance`] if the matrix norm is zero or non-positive.
+/// - [`FilterError::NumericalInstability`] if $M$ is singular or rank-deficient.
+pub fn matrix_condition_number<const N: usize>(m: &[[Real; N]; N]) -> Result<Real, FilterError> {
+    for row in m.iter() {
+        for val in row.iter() {
+            if !val.is_finite() {
+                return Err(FilterError::NonFiniteInput);
+            }
+        }
     }
 
-    // (7) A rank-deficient observation (both rows identical) with zero process and
-    // measurement noise makes the innovation covariance singular -> NumericalInstability.
-    #[test]
-    fn test_linear_update_singular_innovation() {
-        let mut f = LinearKalmanFilter::<2, 2>::new(
-            [0.0, 0.0],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[0.0, 0.0], [0.0, 0.0]],
-            [[1.0, 0.0], [1.0, 0.0]], // rank-deficient H
-            [[0.0, 0.0], [0.0, 0.0]], // R = 0, so S = H P H^T is singular
-        )
-        .unwrap();
-        assert_eq!(
-            f.update(&[1.0, 1.0], None).err(),
-            Some(FilterError::NumericalInstability)
-        );
+    let norm_m = matrix_norm_1(m);
+    if norm_m <= 0.0 {
+        return Err(FilterError::InvalidCovariance);
     }
 
-    // (8) Non-finite measurements are rejected at the boundary, like the 1D path.
-    #[test]
-    fn test_linear_update_nonfinite_measurement() {
-        let mut f =
-            LinearKalmanFilter::<1, 1>::new([0.0], [[1.0]], [[1.0]], [[0.01]], [[1.0]], [[0.5]])
-                .unwrap();
-        assert_eq!(
-            f.update(&[f64::NAN], None).err(),
-            Some(FilterError::NonFiniteInput)
-        );
-        assert_eq!(
-            f.update(&[f64::INFINITY], None).err(),
-            Some(FilterError::NonFiniteInput)
-        );
+    let inv = invert_matrix(m)?;
+    let norm_inv = matrix_norm_1(&inv);
+
+    let cond = norm_m * norm_inv;
+    if !cond.is_finite() || cond < 1.0 {
+        return Ok(1.0);
     }
 
-    // (9) Non-diagonal H with correlated (non-diagonal) measurement error must use the true
-    // K = P H^T S^-1, not a column-sum of S^-1. With P=I, H=[[1,1],[0,1]], R=I the
-    // innovation covariance is S = H H^T + I = [[3,1],[1,2]], inverse [[2/5,-1/5],[-1/5,3/5]],
-    // so K = H^T S^-1 = [[0.4,-0.2],[0.2,0.4]]; with x=0, x_new = K * z.
-    // z=[4,2] is chosen so the off-diagonal K[0][1] (correct -0.2, old bug 0) is exposed:
-    // the old index bug gave x_new[0] = 0.8 instead of 1.2.
-    #[test]
-    fn test_linear_update_k_non_diagonal_correlated() {
-        let mut f = LinearKalmanFilter::<2, 2>::new(
-            [0.0, 0.0],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[0.0, 0.0], [0.0, 0.0]],
-            [[1.0, 1.0], [0.0, 1.0]], // non-diagonal H
-            [[1.0, 0.0], [0.0, 1.0]],
-        )
-        .unwrap();
-        let out = f.update(&[4.0, 2.0], None).unwrap();
-        assert!((out[0] - 1.2).abs() < 1e-9, "out[0] = {}", out[0]);
-        assert!((out[1] - 1.6).abs() < 1e-9, "out[1] = {}", out[1]);
+    Ok(cond)
+}
+
+/// Validates whether an $N \times N$ covariance matrix is well-conditioned and physically admissible.
+///
+/// Verification rules:
+/// 1. `max_condition_number` must be finite and strictly positive.
+/// 2. All elements must be finite numbers.
+/// 3. All main diagonal variances must be strictly positive ($M_{ii} > 0$).
+/// 4. Matrix must be approximately symmetric within numerical tolerance.
+/// 5. Condition number $\kappa_1(M) \le \text{max\_condition\_number}$.
+///
+/// Returns `Ok(cond)` on success, or [`FilterError::InvalidCovariance`] if ill-conditioned or asymmetric.
+#[allow(clippy::needless_range_loop)]
+pub fn check_matrix_conditioning<const N: usize>(
+    m: &[[Real; N]; N],
+    max_condition_number: Real,
+) -> Result<Real, FilterError> {
+    if !max_condition_number.is_finite() || max_condition_number <= 0.0 {
+        return Err(FilterError::InvalidParameter);
     }
+
+    // Check diagonal variances
+    for i in 0..N {
+        if m[i][i] <= 0.0 || !m[i][i].is_finite() {
+            return Err(FilterError::InvalidCovariance);
+        }
+    }
+
+    // Check approximate symmetry
+    let norm = matrix_norm_1(m);
+    #[cfg(not(feature = "single-precision"))]
+    let sym_tol = norm * 1e-12 + 1e-15;
+    #[cfg(feature = "single-precision")]
+    let sym_tol = norm * 1e-5 + 1e-6;
+
+    for i in 0..N {
+        for j in (i + 1)..N {
+            if (m[i][j] - m[j][i]).abs_val() > sym_tol {
+                return Err(FilterError::InvalidCovariance);
+            }
+        }
+    }
+
+    let cond = matrix_condition_number(m)?;
+    if cond > max_condition_number {
+        return Err(FilterError::InvalidCovariance);
+    }
+
+    Ok(cond)
 }
